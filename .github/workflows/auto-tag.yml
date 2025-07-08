@@ -1,88 +1,119 @@
 name: Auto Tag on PR Merge
- 
+
 on:
   pull_request:
     types: [closed]
     branches:
       - main
       - master
- 
+
 jobs:
   auto-tag:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
-   
+
     permissions:
       contents: write
       pull-requests: write
-   
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
- 
+
       - name: Get latest tag
         id: get-latest-tag
         run: |
-          # Get the latest tag, if no tags exist, start with v1.0.0
           latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
           echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
           echo "Latest tag: $latest_tag"
- 
+
+      - name: Get merged commits
+        id: get-commits
+        run: |
+          merge_commit="${{ github.event.pull_request.merge_commit_sha }}"
+          base_ref="${{ github.event.pull_request.base.sha }}"
+          commits=$(git log $base_ref..$merge_commit --pretty=format:"%s%n%b")
+          echo "commits<<EOF" >> $GITHUB_OUTPUT
+          echo "$commits" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Determine version bump
+        id: determine-bump
+        run: |
+          echo "Analyzing commits..."
+          commits="${{ steps.get-commits.outputs.commits }}"
+          bump="patch"
+
+          # Check for BREAKING CHANGE
+          if echo "$commits" | grep -q -i 'BREAKING CHANGE'; then
+            bump="major"
+          # Check for feat (after ticket prefix)
+          elif echo "$commits" | grep -q -E '^[a-zA-Z0-9\-]+[[:space:]]+feat(\(.+\))?:'; then
+            bump="minor"
+          # Check for fix or perf (after ticket prefix)
+          elif echo "$commits" | grep -q -E '^[a-zA-Z0-9\-]+[[:space:]]+(fix|perf)(\(.+\))?:'; then
+            bump="patch"
+          else
+            bump="patch"
+          fi
+
+          echo "bump=$bump" >> $GITHUB_OUTPUT
+          echo "Determined version bump: $bump"
+
+      
+
       - name: Calculate next version
         id: next-version
         run: |
           latest_tag="${{ steps.get-latest-tag.outputs.latest_tag }}"
-         
-          # Remove 'v' prefix if it exists
+          bump="${{ steps.determine-bump.outputs.bump }}"
+
           version=${latest_tag#v}
-         
-          # Split version into parts
           IFS='.' read -ra VERSION_PARTS <<< "$version"
           major=${VERSION_PARTS[0]}
           minor=${VERSION_PARTS[1]}
           patch=${VERSION_PARTS[2]}
-         
-          # Increment patch version
-          new_patch=$((patch + 1))
-          new_version="v${major}.${minor}.${new_patch}"
-         
+
+          if [[ "$bump" == "major" ]]; then
+            major=$((major + 1))
+            minor=0
+            patch=0
+          elif [[ "$bump" == "minor" ]]; then
+            minor=$((minor + 1))
+            patch=0
+          else
+            patch=$((patch + 1))
+          fi
+
+          new_version="v${major}.${minor}.${patch}"
           echo "new_version=$new_version" >> $GITHUB_OUTPUT
           echo "Next version: $new_version"
- 
+
       - name: Create and push new tag
-        id: create-tag
         run: |
           new_version="${{ steps.next-version.outputs.new_version }}"
-         
-          # Configure git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-         
-          # Create tag on the merge commit
           git tag -a "$new_version" -m "Auto-generated tag $new_version for PR #${{ github.event.pull_request.number }}"
-         
-          # Push the tag
           git push origin "$new_version"
-         
-          echo "Created and pushed tag: $new_version"
- 
+
       - name: Comment on PR with new tag
         uses: actions/github-script@v7
         with:
           script: |
             const newVersion = '${{ steps.next-version.outputs.new_version }}';
             const prNumber = context.payload.pull_request.number;
-           
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: prNumber,
-              body: `🎉 This PR has been tagged with version **${newVersion}**`
+              body: `🚀 This PR has been tagged as **${newVersion}** based on commit messages.`
             });
- 
+
       - name: Create GitHub Release
         uses: actions/github-script@v7
         with:
@@ -90,7 +121,7 @@ jobs:
             const newVersion = '${{ steps.next-version.outputs.new_version }}';
             const prNumber = context.payload.pull_request.number;
             const prTitle = context.payload.pull_request.title;
-           
+
             await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
