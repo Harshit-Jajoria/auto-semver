@@ -1,0 +1,281 @@
+name: Preview Version on PR Comment
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  preview-version:
+    # Only run on OPEN PR comments that contain "Preview-Version"
+    if: |
+      github.event.issue.pull_request &&
+      github.event.issue.state == 'open' &&
+      contains(github.event.comment.body, 'Preview-Version')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Get PR details
+        id: pr-details
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            
+            // Double-check PR is open
+            if (pr.state !== 'open') {
+              throw new Error(`PR #${pr.number} is ${pr.state}, not open`);
+            }
+            
+            console.log(`PR #${pr.number}: ${pr.title}`);
+            console.log(`Base: ${pr.base.ref}, Head: ${pr.head.ref}`);
+            console.log(`Base SHA: ${pr.base.sha}, Head SHA: ${pr.head.sha}`);
+            console.log(`PR State: ${pr.state}`);
+            
+            return {
+              number: pr.number,
+              title: pr.title,
+              base_ref: pr.base.ref,
+              head_ref: pr.head.ref,
+              base_sha: pr.base.sha,
+              head_sha: pr.head.sha,
+              state: pr.state
+            };
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ fromJson(steps.pr-details.outputs.result).head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get latest tag
+        id: get-latest-tag
+        run: |
+          if [ -n "$(git tag)" ] && git tag --sort=-v:refname | grep -E "^X[0-9]+\\.[0-9]+\\.[0-9]+$" | head -n1; then
+            latest_tag=$(git tag --sort=-v:refname | grep -E "^X[0-9]+\\.[0-9]+\\.[0-9]+$" | head -n1)
+          else
+            latest_tag="X0.0.0"
+            echo "No existing tags found, starting from X0.0.0"
+          fi
+          echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
+          echo "Latest tag: $latest_tag"
+
+      - name: Get PR commits
+        id: get-commits
+        run: |
+          base_sha="${{ fromJson(steps.pr-details.outputs.result).base_sha }}"
+          head_sha="${{ fromJson(steps.pr-details.outputs.result).head_sha }}"
+          
+          echo "Getting commits between $base_sha and $head_sha"
+          commits=$(git log $base_sha..$head_sha --pretty=format:"%s")
+          
+          echo "commits<<EOF" >> $GITHUB_OUTPUT
+          echo "$commits" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "Commits to analyze:"
+          echo "$commits"
+
+      - name: Determine version bump
+        id: determine-bump
+        run: |
+          echo "=== Analyzing commits for version bump ==="
+          commits="${{ steps.get-commits.outputs.commits }}"
+          echo "Raw commits:"
+          echo "$commits"
+          echo ""
+          
+          # Strip Jira IDs and analyze clean commit messages
+          clean_commits=$(echo "$commits" | sed -E 's/^[A-Z]+-[0-9]+[[:space:]]+//')
+          echo "Clean commits (after Jira ID removal):"
+          echo "$clean_commits"
+          echo ""
+          
+          bump="patch"
+          found_types=()
+          
+          # Check for BREAKING CHANGE (most comprehensive check)
+          if echo "$commits" | grep -q -E '(BREAKING CHANGE|BREAKING-CHANGE)'; then
+            bump="major"
+            found_types+=("BREAKING CHANGE")
+            echo "✅ Found BREAKING CHANGE - major bump"
+          # Check for feat (after optional Jira ticket prefix)
+          elif echo "$clean_commits" | grep -q -E '^feat(\(.+\))?:'; then
+            bump="minor"
+            found_types+=("feat")
+            echo "✅ Found feat - minor bump"
+          # Check for fix or perf (after optional Jira ticket prefix)
+          elif echo "$clean_commits" | grep -q -E '^(fix|perf)(\(.+\))?:'; then
+            bump="patch"
+            found_types+=("fix/perf")
+            echo "✅ Found fix/perf - patch bump"
+          else
+            bump="patch"
+            found_types+=("default")
+            echo "ℹ️ No specific conventional commit type found - defaulting to patch bump"
+          fi
+          
+          # Also collect other commit types for display
+          if echo "$clean_commits" | grep -q -E '^feat(\(.+\))?:'; then
+            [[ ! " ${found_types[@]} " =~ " feat " ]] && found_types+=("feat")
+          fi
+          if echo "$clean_commits" | grep -q -E '^(fix|perf)(\(.+\))?:'; then
+            [[ ! " ${found_types[@]} " =~ " fix/perf " ]] && found_types+=("fix/perf")
+          fi
+          if echo "$clean_commits" | grep -q -E '^(docs|style|refactor|test|chore)(\(.+\))?:'; then
+            found_types+=("other")
+          fi
+          
+          echo "bump=$bump" >> $GITHUB_OUTPUT
+          echo "found_types=${found_types[*]}" >> $GITHUB_OUTPUT
+          echo "=== Final determination: $bump ==="
+
+      - name: Calculate preview version
+        id: preview-version
+        run: |
+          latest_tag="${{ steps.get-latest-tag.outputs.latest_tag }}"
+          bump="${{ steps.determine-bump.outputs.bump }}"
+          
+          echo "Current version: $latest_tag"
+          echo "Bump type: $bump"
+          
+          # Remove 'X' prefix for calculation
+          version=${latest_tag#X}
+          IFS='.' read -ra VERSION_PARTS <<< "$version"
+          
+          major=${VERSION_PARTS[0]:-0}
+          minor=${VERSION_PARTS[1]:-0}
+          patch=${VERSION_PARTS[2]:-0}
+          
+          echo "Parsed version: major=$major, minor=$minor, patch=$patch"
+          
+          if [[ "$bump" == "major" ]]; then
+            major=$((major + 1))
+            minor=0
+            patch=0
+          elif [[ "$bump" == "minor" ]]; then
+            minor=$((minor + 1))
+            patch=0
+          else
+            patch=$((patch + 1))
+          fi
+          
+          preview_version="X${major}.${minor}.${patch}"
+          echo "preview_version=$preview_version" >> $GITHUB_OUTPUT
+          echo "Preview version: $preview_version"
+
+      - name: Generate preview date
+        id: preview-date
+        run: |
+          preview_date=$(date '+%d-%m-%Y')
+          echo "preview_date=$preview_date" >> $GITHUB_OUTPUT
+          echo "Preview date: $preview_date"
+
+      - name: Comment with version preview
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prDetails = ${{ steps.pr-details.outputs.result }};
+            const currentVersion = '${{ steps.get-latest-tag.outputs.latest_tag }}';
+            const previewVersion = '${{ steps.preview-version.outputs.preview_version }}';
+            const previewDate = '${{ steps.preview-date.outputs.preview_date }}';
+            const bumpType = '${{ steps.determine-bump.outputs.bump }}';
+            const foundTypes = '${{ steps.determine-bump.outputs.found_types }}';
+            const commits = `${{ steps.get-commits.outputs.commits }}`;
+            const commenter = context.payload.comment.user.login;
+            
+            // Get current date and time
+            const now = new Date();
+            const currentDateTime = now.toLocaleString('en-GB', {
+              day: '2-digit',
+              month: '2-digit',
+              year: 'numeric',
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit',
+              hour12: false
+            });
+            
+            // Format commits for display
+            const commitLines = commits.split('\n').filter(line => line.trim());
+            let commitsList = '';
+            commitLines.forEach(commit => {
+              if (commit.trim()) {
+                commitsList += `- ${commit}\n`;
+              }
+            });
+            
+            // Create the preview comment
+            const commentBody = `## 🔮 Version Preview
+            
+            Hey @${commenter}! Here's what the version would be if this PR were merged right now:
+            
+            **📅 As of:** ${currentDateTime}
+            
+            **🎯 The preview version will be:** \`${previewVersion}:${previewDate}\`
+            
+            ### 📊 Version Information
+            | Item | Value |
+            |------|-------|
+            | **Current Version** | \`${currentVersion}\` |
+            | **Preview Version** | \`${previewVersion}:${previewDate}\` |
+            | **Bump Type** | ${bumpType} |
+            | **Change** | ${currentVersion} → ${previewVersion} |
+            | **Commit Types Found** | ${foundTypes} |
+            
+            ### 📝 Commits in this PR
+            ${commitsList}
+            
+            ### 🎯 How Version is Determined
+            - **Major** (X.0.0): Contains \`BREAKING CHANGE\` or \`BREAKING-CHANGE\`
+            - **Minor** (X.Y.0): Contains \`feat:\` commits
+            - **Patch** (X.Y.Z): Contains \`fix:\` or \`perf:\` commits
+            - **Default**: Patch bump for other commit types
+            
+            ### ⚠️ Important Notes
+            - This is a **preview only** - no tags or releases are created
+            - The actual version may differ if commits are added/removed
+            - Version is calculated based on [Conventional Commits](https://www.conventionalcommits.org/) standards
+            - Jira IDs (like \`WMAL-2830\`) are automatically stripped during analysis
+            - **Only works on open PRs** - closed/merged PRs are ignored
+            
+            ---
+            *Preview generated by GitHub Actions on ${currentDateTime} • Use \`Preview-Version\` comment to regenerate*`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+      - name: Handle preview failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commenter = context.payload.comment.user.login;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            
+            const commentBody = `## ❌ Version Preview Failed
+            
+            Sorry @${commenter}, I couldn't generate a version preview for this PR.
+            
+            **🔗 [View Workflow Run](${runUrl})**
+            
+            Please check the logs for more details or try again later.
+            
+            **Note:** This only works on open PRs.`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
