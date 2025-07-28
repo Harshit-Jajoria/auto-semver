@@ -1,21 +1,23 @@
-name: Auto Tag on PR Merge
+name: Auto Tag and Release on PR Merge
 
 on:
   pull_request:
     types: [closed]
     branches:
       - main
-      - master
+
+concurrency:
+  group: auto-tag-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   auto-tag:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
-
     permissions:
       contents: write
       pull-requests: write
-
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -26,7 +28,12 @@ jobs:
       - name: Get latest tag
         id: get-latest-tag
         run: |
-          latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
+          if [ -n "$(git tag)" ] && git tag --sort=-v:refname | grep -E "^v[0-9]+\\.[0-9]+\\.[0-9]+$" | head -n1; then
+            latest_tag=$(git tag --sort=-v:refname | grep -E "^v[0-9]+\\.[0-9]+\\.[0-9]+$" | head -n1)
+          else
+            latest_tag="v0.0.0"
+            echo "No existing tags found, starting from v0.0.0"
+          fi
           echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
           echo "Latest tag: $latest_tag"
 
@@ -35,48 +42,69 @@ jobs:
         run: |
           merge_commit="${{ github.event.pull_request.merge_commit_sha }}"
           base_ref="${{ github.event.pull_request.base.sha }}"
-          commits=$(git log $base_ref..$merge_commit --pretty=format:"%s%n%b")
+          commits=$(git log $base_ref..$merge_commit --pretty=format:"%s")
           echo "commits<<EOF" >> $GITHUB_OUTPUT
           echo "$commits" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+          echo "Commits to analyze:"
+          echo "$commits"
 
       - name: Determine version bump
         id: determine-bump
         run: |
-          echo "Analyzing commits..."
+          echo "=== Analyzing commits for version bump ==="
           commits="${{ steps.get-commits.outputs.commits }}"
+          echo "Raw commits:"
+          echo "$commits"
+          echo ""
+          
+          # Strip Jira IDs and analyze clean commit messages
+          clean_commits=$(echo "$commits" | sed -E 's/^[A-Z]+-[0-9]+[[:space:]]+//')
+          echo "Clean commits (after Jira ID removal):"
+          echo "$clean_commits"
+          echo ""
+          
           bump="patch"
-
-          # Check for BREAKING CHANGE
-          if echo "$commits" | grep -q -i 'BREAKING CHANGE'; then
+          
+          # Check for BREAKING CHANGE (most comprehensive check)
+          if echo "$commits" | grep -q -E '(BREAKING CHANGE|BREAKING-CHANGE):'; then
             bump="major"
-          # Check for feat (after ticket prefix)
-          elif echo "$commits" | grep -q -E '^[a-zA-Z0-9\-]+[[:space:]]+feat(\(.+\))?:'; then
+            echo "✅ Found BREAKING CHANGE - major bump"
+          # Check for feat (after optional Jira ticket prefix)
+          elif echo "$clean_commits" | grep -q -E '^feat(\(.+\))?:'; then
             bump="minor"
-          # Check for fix or perf (after ticket prefix)
-          elif echo "$commits" | grep -q -E '^[a-zA-Z0-9\-]+[[:space:]]+(fix|perf)(\(.+\))?:'; then
+            echo "✅ Found feat - minor bump"
+          # Check for fix or perf (after optional Jira ticket prefix)
+          elif echo "$clean_commits" | grep -q -E '^(fix|perf)(\(.+\))?:'; then
             bump="patch"
+            echo "✅ Found fix/perf - patch bump"
           else
             bump="patch"
+            echo "ℹ️ No specific conventional commit type found - defaulting to patch bump"
           fi
-
+          
           echo "bump=$bump" >> $GITHUB_OUTPUT
-          echo "Determined version bump: $bump"
-
-      
+          echo "=== Final determination: $bump ==="
 
       - name: Calculate next version
         id: next-version
         run: |
           latest_tag="${{ steps.get-latest-tag.outputs.latest_tag }}"
           bump="${{ steps.determine-bump.outputs.bump }}"
-
+          
+          echo "Current version: $latest_tag"
+          echo "Bump type: $bump"
+          
+          # Remove 'v' prefix for calculation
           version=${latest_tag#v}
           IFS='.' read -ra VERSION_PARTS <<< "$version"
-          major=${VERSION_PARTS[0]}
-          minor=${VERSION_PARTS[1]}
-          patch=${VERSION_PARTS[2]}
-
+          
+          major=${VERSION_PARTS[0]:-0}
+          minor=${VERSION_PARTS[1]:-0}
+          patch=${VERSION_PARTS[2]:-0}
+          
+          echo "Parsed version: major=$major, minor=$minor, patch=$patch"
+          
           if [[ "$bump" == "major" ]]; then
             major=$((major + 1))
             minor=0
@@ -87,47 +115,175 @@ jobs:
           else
             patch=$((patch + 1))
           fi
-
+          
           new_version="v${major}.${minor}.${patch}"
           echo "new_version=$new_version" >> $GITHUB_OUTPUT
           echo "Next version: $new_version"
 
+      - name: Generate release date
+        id: release-date
+        run: |
+          release_date=$(date '+%d-%m-%Y')
+          echo "release_date=$release_date" >> $GITHUB_OUTPUT
+          echo "Release date: $release_date"
+
+      - name: Validate new tag doesn't exist
+        run: |
+          new_version="${{ steps.next-version.outputs.new_version }}"
+          if git tag -l | grep -q "^$new_version$"; then
+            echo "❌ Tag $new_version already exists!"
+            exit 1
+          fi
+          echo "✅ Tag $new_version is available"
+
       - name: Create and push new tag
         run: |
           new_version="${{ steps.next-version.outputs.new_version }}"
+          release_date="${{ steps.release-date.outputs.release_date }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$new_version" -m "Auto-generated tag $new_version for PR #${{ github.event.pull_request.number }}"
+          
+          # Create annotated tag with detailed message
+          git tag -a "$new_version" -m "Auto-generated tag & release $new_version:$release_date for PR #${{ github.event.pull_request.number }}" \
+            -m "Bump type: ${{ steps.determine-bump.outputs.bump }}" \
+            -m "Previous version: ${{ steps.get-latest-tag.outputs.latest_tag }}" \
+            -m "PR: #${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }}"
+          
           git push origin "$new_version"
-
-      - name: Comment on PR with new tag
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const newVersion = '${{ steps.next-version.outputs.new_version }}';
-            const prNumber = context.payload.pull_request.number;
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: prNumber,
-              body: `🚀 This PR has been tagged as **${newVersion}** based on commit messages.`
-            });
+          echo "✅ Tag $new_version created and pushed"
 
       - name: Create GitHub Release
         uses: actions/github-script@v7
         with:
           script: |
             const newVersion = '${{ steps.next-version.outputs.new_version }}';
+            const releaseDate = '${{ steps.release-date.outputs.release_date }}';
             const prNumber = context.payload.pull_request.number;
             const prTitle = context.payload.pull_request.title;
+            const bumpType = '${{ steps.determine-bump.outputs.bump }}';
+            const previousVersion = '${{ steps.get-latest-tag.outputs.latest_tag }}';
+            const commits = `${{ steps.get-commits.outputs.commits }}`;
+            
+            // Create detailed release notes
+            let releaseBody = `## 🚀 Release ${newVersion}:${releaseDate}\n\n`;
+            releaseBody += `**📅 Release Date:** ${releaseDate}\n`;
+            releaseBody += `**📈 Version Bump:** ${bumpType.toUpperCase()} (${previousVersion} → ${newVersion})\n`;
+            releaseBody += `**🔗 Source PR:** #${prNumber} - ${prTitle}\n\n`;
+            releaseBody += `### 📝 Changes in this Release\n\n`;
+            
+            // Format commits for release notes
+            const commitLines = commits.split('\n').filter(line => line.trim());
+            if (commitLines.length > 0) {
+              commitLines.forEach(commit => {
+                if (commit.trim()) {
+                  releaseBody += `- ${commit.trim()}\n`;
+                }
+              });
+            } else {
+              releaseBody += `- Merged PR #${prNumber}: ${prTitle}\n`;
+            }
+            
+            releaseBody += `\n---\n*This release was automatically generated by GitHub Actions*`;
+            
+            try {
+              const release = await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: newVersion,
+                name: `${newVersion}:${releaseDate}`,
+                body: releaseBody,
+                draft: false,
+                prerelease: false
+              });
+              
+              console.log(`✅ GitHub Release created: ${release.data.html_url}`);
+            } catch (error) {
+              console.error('❌ Failed to create GitHub Release:', error);
+              throw error;
+            }
 
-            await github.rest.repos.createRelease({
+      - name: Comment on PR with results
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const newVersion = '${{ steps.next-version.outputs.new_version }}';
+            const releaseDate = '${{ steps.release-date.outputs.release_date }}';
+            const prNumber = context.payload.pull_request.number;
+            const bumpType = '${{ steps.determine-bump.outputs.bump }}';
+            const previousVersion = '${{ steps.get-latest-tag.outputs.latest_tag }}';
+            const releaseUrl = '${{ github.server_url }}/${{ github.repository }}/releases/tag/' + newVersion;
+
+            const commentBody = `## 🚀 Automatic Release Created
+
+            Your PR has been successfully merged and a new release has been automatically created!
+
+            ### Release Details
+            ✅ **New Release:** \`${newVersion}:${releaseDate}\`
+            📈 **Bump Type:** ${bumpType.toUpperCase()}
+            📊 **Version Change:** ${previousVersion} → ${newVersion}
+            📅 **Release Date:** ${releaseDate}
+            
+            **🔗 [View Release](${releaseUrl})**
+            
+            ---
+            *This tag and release were automatically generated based on your commit messages following [Conventional Commits](https://www.conventionalcommits.org/) standards.*`;
+            
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              tag_name: newVersion,
-              name: newVersion,
-              body: `Auto-generated release for PR #${prNumber}: ${prTitle}`,
-              draft: false,
-              prerelease: false
+              issue_number: prNumber,
+              body: commentBody
+            });
+
+      - name: Create workflow summary
+        run: |
+          release_date="${{ steps.release-date.outputs.release_date }}"
+          echo "## 🚀 Auto-Tag and Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Previous Version** | \`${{ steps.get-latest-tag.outputs.latest_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **New Version** | \`${{ steps.next-version.outputs.new_version }}:${release_date}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Bump Type** | ${{ steps.determine-bump.outputs.bump }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Release Date** | ${release_date} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Source PR** | #${{ github.event.pull_request.number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **PR Title** | ${{ github.event.pull_request.title }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Status:** Tag and Release created successfully!" >> $GITHUB_STEP_SUMMARY
+          
+          # Add link to release
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 **[View Release](../../releases/tag/${{ steps.next-version.outputs.new_version }})**" >> $GITHUB_STEP_SUMMARY
+
+      - name: Handle workflow failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            
+            const commentBody = `## ❌ Automatic Release Failed
+
+            The automatic tagging and release workflow encountered an error while processing your merged PR.
+
+            ### What happened?
+            - The workflow attempted to create a new release but failed
+            - Your code changes have been merged successfully
+            - Only the automatic release creation was affected
+
+            ### Next Steps
+            1. **[� View Workflow Logs](${runUrl})** to see the specific error
+            2. Check if there are any issues with commit message formatting
+            3. You can manually create a release if needed
+            4. Contact the team if the issue persists
+
+            ---
+            *This is an automated message from the release workflow.*`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: commentBody
             });
