@@ -33,6 +33,11 @@ jobs:
               throw new Error(`PR #${pr.number} is ${pr.state}, not open`);
             }
             
+            // Ensure PR is targeting main branch
+            if (pr.base.ref !== 'main') {
+              throw new Error(`PR #${pr.number} targets '${pr.base.ref}', but auto-versioning only works for PRs targeting 'main'`);
+            }
+            
             console.log(`PR #${pr.number}: ${pr.title}`);
             console.log(`Base: ${pr.base.ref}, Head: ${pr.head.ref}`);
             console.log(`Base SHA: ${pr.base.sha}, Head SHA: ${pr.head.sha}`);
@@ -58,11 +63,11 @@ jobs:
       - name: Get latest tag
         id: get-latest-tag
         run: |
-          if [ -n "$(git tag)" ] && git tag --sort=-v:refname | grep -E "^X[0-9]+\\.[0-9]+\\.[0-9]+$" | head -n1; then
-            latest_tag=$(git tag --sort=-v:refname | grep -E "^X[0-9]+\\.[0-9]+\\.[0-9]+$" | head -n1)
+          if [ -n "$(git tag)" ] && git tag --sort=-v:refname | grep -E "^v[0-9]+\\.[0-9]+\\.[0-9]+$" | head -n1; then
+            latest_tag=$(git tag --sort=-v:refname | grep -E "^v[0-9]+\\.[0-9]+\\.[0-9]+$" | head -n1)
           else
-            latest_tag="X0.0.0"
-            echo "No existing tags found, starting from X0.0.0"
+            latest_tag="v0.0.0"
+            echo "No existing tags found, starting from v0.0.0"
           fi
           echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
           echo "Latest tag: $latest_tag"
@@ -101,7 +106,7 @@ jobs:
           found_types=()
           
           # Check for BREAKING CHANGE (most comprehensive check)
-          if echo "$commits" | grep -q -E '(BREAKING CHANGE|BREAKING-CHANGE)'; then
+          if echo "$commits" | grep -q -E '(BREAKING CHANGE|BREAKING-CHANGE):'; then
             bump="major"
             found_types+=("BREAKING CHANGE")
             echo "✅ Found BREAKING CHANGE - major bump"
@@ -121,17 +126,6 @@ jobs:
             echo "ℹ️ No specific conventional commit type found - defaulting to patch bump"
           fi
           
-          # Also collect other commit types for display
-          if echo "$clean_commits" | grep -q -E '^feat(\(.+\))?:'; then
-            [[ ! " ${found_types[@]} " =~ " feat " ]] && found_types+=("feat")
-          fi
-          if echo "$clean_commits" | grep -q -E '^(fix|perf)(\(.+\))?:'; then
-            [[ ! " ${found_types[@]} " =~ " fix/perf " ]] && found_types+=("fix/perf")
-          fi
-          if echo "$clean_commits" | grep -q -E '^(docs|style|refactor|test|chore)(\(.+\))?:'; then
-            found_types+=("other")
-          fi
-          
           echo "bump=$bump" >> $GITHUB_OUTPUT
           echo "found_types=${found_types[*]}" >> $GITHUB_OUTPUT
           echo "=== Final determination: $bump ==="
@@ -145,8 +139,8 @@ jobs:
           echo "Current version: $latest_tag"
           echo "Bump type: $bump"
           
-          # Remove 'X' prefix for calculation
-          version=${latest_tag#X}
+          # Remove 'v' prefix for calculation
+          version=${latest_tag#v}
           IFS='.' read -ra VERSION_PARTS <<< "$version"
           
           major=${VERSION_PARTS[0]:-0}
@@ -166,7 +160,7 @@ jobs:
             patch=$((patch + 1))
           fi
           
-          preview_version="X${major}.${minor}.${patch}"
+          preview_version="v${major}.${minor}.${patch}"
           echo "preview_version=$preview_version" >> $GITHUB_OUTPUT
           echo "Preview version: $preview_version"
 
@@ -186,7 +180,6 @@ jobs:
             const previewVersion = '${{ steps.preview-version.outputs.preview_version }}';
             const previewDate = '${{ steps.preview-date.outputs.preview_date }}';
             const bumpType = '${{ steps.determine-bump.outputs.bump }}';
-            const foundTypes = '${{ steps.determine-bump.outputs.found_types }}';
             const commits = `${{ steps.get-commits.outputs.commits }}`;
             const commenter = context.payload.comment.user.login;
             
@@ -202,51 +195,28 @@ jobs:
               hour12: false
             });
             
-            // Format commits for display
-            const commitLines = commits.split('\n').filter(line => line.trim());
-            let commitsList = '';
-            commitLines.forEach(commit => {
-              if (commit.trim()) {
-                commitsList += `- ${commit}\n`;
-              }
-            });
-            
             // Create the preview comment
-            const commentBody = `## 🔮 Version Preview
+            const commentBody = `## 🔮 Version Preview for PR #${prDetails.number}
             
-            Hey @${commenter}! Here's what the version would be if this PR were merged right now:
+            Hey @${commenter}! Here's what the version would be if this PR were merged to \`main\` right now:
             
-            **📅 As of:** ${currentDateTime}
-            
-            **🎯 The preview version will be:** \`${previewVersion}:${previewDate}\`
-            
-            ### 📊 Version Information
+            **📅 Preview Generated:** ${currentDateTime}
+
+            **🎯 The preview release version will be:** \`${previewVersion}:${previewDate}\`
+
+            ### 📊 Version Details
             | Item | Value |
             |------|-------|
-            | **Current Version** | \`${currentVersion}\` |
-            | **Preview Version** | \`${previewVersion}:${previewDate}\` |
-            | **Bump Type** | ${bumpType} |
+            | **Version Bump** | ${bumpType.toUpperCase()} |
             | **Change** | ${currentVersion} → ${previewVersion} |
-            | **Commit Types Found** | ${foundTypes} |
+            | **Target Branch** | \`${prDetails.base_ref}\` |
             
-            ### 📝 Commits in this PR
-            ${commitsList}
-            
-            ### 🎯 How Version is Determined
-            - **Major** (X.0.0): Contains \`BREAKING CHANGE\` or \`BREAKING-CHANGE\`
-            - **Minor** (X.Y.0): Contains \`feat:\` commits
-            - **Patch** (X.Y.Z): Contains \`fix:\` or \`perf:\` commits
-            - **Default**: Patch bump for other commit types
-            
-            ### ⚠️ Important Notes
-            - This is a **preview only** - no tags or releases are created
-            - The actual version may differ if commits are added/removed
-            - Version is calculated based on [Conventional Commits](https://www.conventionalcommits.org/) standards
-            - Jira IDs (like \`WMAL-2830\`) are automatically stripped during analysis
-            - **Only works on open PRs** - closed/merged PRs are ignored
-            
+            ### ℹ️ Important Notes
+            - ✅ This is a **preview only** - no tags or releases are created
+            - ⚠️ The actual version may differ if commits are added/removed before merge
+
             ---
-            *Preview generated by GitHub Actions on ${currentDateTime} • Use \`Preview-Version\` comment to regenerate*`;
+            *Version preview generated on ${currentDateTime} • Comment \`Preview-Version\` to refresh*`;
             
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -267,11 +237,20 @@ jobs:
             
             Sorry @${commenter}, I couldn't generate a version preview for this PR.
             
-            **🔗 [View Workflow Run](${runUrl})**
+            ### Possible Reasons:
+            - � PR is not targeting the \`main\` branch (auto-versioning only works for main)
+            - 🚫 PR is not in 'open' state
+            - 🚫 Unable to access commit history
+            - 🚫 Repository permissions issue
             
-            Please check the logs for more details or try again later.
+            ### Next Steps:
+            1. **[📋 Check Workflow Logs](${runUrl})** for detailed error information
+            2. Ensure your PR targets the \`main\` branch
+            3. Verify the PR is still open
+            4. Try commenting \`Preview-Version\` again
             
-            **Note:** This only works on open PRs.`;
+            ---
+            *Error occurred on ${new Date().toLocaleString('en-GB')} • Auto-versioning only works for PRs targeting \`main\`*`;
             
             await github.rest.issues.createComment({
               owner: context.repo.owner,
