@@ -10,8 +10,8 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 # ===== CONFIG =====
-PHONE_NUMBER = "919990795265"  # recipient's phone number in international format
-AUDIO_URL = "https://raw.githubusercontent.com/Harshit-Jajoria/auto-semver/main/WhatsApp%20Audio.mp3"
+PHONE_NUMBER = ""  # recipient's phone number in international format
+AUDIO_URL = "https://raw.githubusercon"
 AUDIO_PATH = r"/Users/harshitjajoria/Developer/videos/automatic_calls/audio.mp3"
 PROFILE_DIR = os.path.expanduser("~/.whatsapp_profile")
 
